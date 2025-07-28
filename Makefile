@@ -2,7 +2,7 @@ EXAMPLES_SOURCES = $(wildcard examples/*.c)
 EXAMPLES = $(patsubst examples/%.c, build/%, $(EXAMPLES_SOURCES))
 OUTDIR = build
 
-all: gen_headers $(EXAMPLES)
+all: gen_headers build/libwaylib.a build/libwaylib.so $(EXAMPLES)
 
 $(OUTDIR):
 	mkdir -p $(OUTDIR)
@@ -10,7 +10,16 @@ $(OUTDIR):
 LIBS = -lwayland-cursor -lwayland-client -lxkbcommon  -lwayland-egl
 
 $(EXAMPLES): $(OUTDIR)/%: examples/%.c $(OUTDIR) waylib.c waylib.h
-	$(CC) -o $@ $< -I./ $(LIBS) -g3
+	$(CC) -o $@ $< -I./  $(LIBS) -g3
+
+build/waylib.o: waylib.c waylib.h $(OUTDIR)
+	$(CC) -c -fPIC $< -o $@
+
+build/libwaylib.so: build/waylib.o waylib.c waylib.h
+	$(CC) -shared $< $(LIBS) -o $@
+
+build/libwaylib.a: build/waylib.o waylib.c waylib.h
+	ar rcs $@ $<
 
 debug: $(EXAMPLES)
 	@for exe in $(EXAMPLES); do \
