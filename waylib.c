@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include <dlfcn.h>
+#include <assert.h>
 
 struct libdecor;
 enum libdecor_error {
@@ -103,17 +104,26 @@ struct libdecor_frame_interface {
 typedef struct libdecor* (*libdecor_new_type)(struct wl_display *display, struct libdecor_interface *iface);
 typedef void (*libdecor_unref_type)(struct libdecor*);
 typedef struct libdecor_frame* (*libdecor_decorate_type)(struct libdecor *context, struct wl_surface *surface, struct libdecor_frame_interface *iface, void *user_data);
+typedef void (*libdecor_frame_set_title_type)(struct libdecor_frame* frame, const char* string);
+typedef libdecor_frame_set_title_type libdecor_frame_set_app_id_type;
+typedef int (*libdecor_dispatch_type)(struct libdecor *context, int time);
+typedef int (*libdecor_frame_map_type)(struct libdecor_frame* frame);
+typedef int (*libdecor_frame_close_type)(struct libdecor_frame* frame);
 
 libdecor_new_type libdecor_new = NULL;
 libdecor_unref_type libdecor_unref = NULL;
 libdecor_decorate_type libdecor_decorate = NULL;
+libdecor_frame_set_title_type libdecor_frame_set_title = NULL;
+libdecor_frame_set_app_id_type libdecor_frame_set_app_id = NULL;
+libdecor_dispatch_type libdecor_dispatch = NULL;
+libdecor_frame_close_type libdecor_frame_close = NULL;
+libdecor_frame_map_type libdecor_frame_map = NULL;
 
 #define WAYLIB_UNUSED(x) (void)(x)
 
 void registry_add_object(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version);
 void registry_remove_object(void *data, struct wl_registry *registry, uint32_t name);
 struct wl_registry_listener registry_listener = {&registry_add_object, &registry_remove_object};
-
 
 void xdg_wm_base_ping_handler(void* data, struct xdg_wm_base* wm_base, uint32_t serial) {
     xdg_wm_base_pong(wm_base, serial);
@@ -124,11 +134,11 @@ void xdg_surface_configure_handler(void* data, struct xdg_surface* xdg_surface, 
 }
 
 void xdg_toplevel_configure_handler(void* data, struct xdg_toplevel* toplevel, int32_t width, int32_t height, struct wl_array* states) {
-    waylib_display* display = (waylib_display*)xdg_toplevel_get_user_data(toplevel);
+    waylib_display* display = (waylib_display*)data;
 }
 
 void xdg_toplevel_close_handler(void* data, struct xdg_toplevel *toplevel) {
-	waylib_display* display = (waylib_display*)xdg_toplevel_get_user_data(toplevel);
+	waylib_display* display = (waylib_display*)data;
 }
 
 void xdg_decoration_configure_handler(void* data, struct zxdg_toplevel_decoration_v1* zxdg_toplevel_decoration_v1, uint32_t mode) {
@@ -139,6 +149,15 @@ void surface_frame_done(void* data, struct wl_callback *cb, uint32_t time) {
 
 }
 
+const struct xdg_wm_base_listener xdg_wm_base_listener = {
+	.ping = xdg_wm_base_ping_handler,
+};
+
+#define WAYLIB_PROC_DEF(proc, name) if (name == NULL && proc != NULL) { \
+	void* ptr = dlsym(proc, #name); \
+	if (ptr != NULL) memcpy(&name, &ptr, sizeof(name##_type)); \
+}
+
 waylib_bool waylib_display_open(waylib_display* display) {
     memset(display, 0, sizeof(waylib_display));
     display->dpy = wl_display_connect(NULL);
@@ -147,55 +166,24 @@ waylib_bool waylib_display_open(waylib_display* display) {
 	}
 
     display->registry = wl_display_get_registry(display->dpy);
+
     wl_registry_add_listener(display->registry, &registry_listener, display);
-
-    wl_display_roundtrip(display->dpy);
-    wl_display_dispatch(display->dpy);
-
-	static const struct xdg_wm_base_listener xdg_wm_base_listener = {
-		.ping = xdg_wm_base_ping_handler,
-	};
-
-	static const struct xdg_surface_listener xdg_surface_listener = {
-		.configure = xdg_surface_configure_handler,
-	};
-
-	static const struct wl_callback_listener wl_surface_frame_listener = {
-		.done = surface_frame_done,
-	};
-
-
-	xdg_wm_base_add_listener(display->xdg_wm_base, &xdg_wm_base_listener, display);
 
 	display->xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 
-	static const struct xdg_toplevel_listener xdg_toplevel_listener = {
-		.configure = xdg_toplevel_configure_handler,
-		.close = xdg_toplevel_close_handler,
-	};
-
-
-	xdg_toplevel_add_listener(display->xdg_toplevel, &xdg_toplevel_listener, display);
-
-    if (display->decoration_manager) {
-        display->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(display->decoration_manager, display->xdg_toplevel);
-
-		static const struct zxdg_toplevel_decoration_v1_listener xdg_decoration_listener = {
-				.configure = xdg_decoration_configure_handler
-		};
-
-		zxdg_toplevel_decoration_v1_add_listener(display->decoration, &xdg_decoration_listener, NULL);
-	} else {
+	if (display->decoration_manager == NULL) {
         display->libdecor = dlopen("libdecor-0.so.0", RTLD_LAZY | RTLD_LOCAL);
         if (display->libdecor) {
-            void* ptr = dlsym(display->libdecor, "libdecor_new");
-            if (ptr != NULL) memcpy(&libdecor_new, &ptr, sizeof(libdecor_new_type));
-            ptr = dlsym(display->libdecor, "libdecor_unref");
-            if (ptr != NULL) memcpy(&libdecor_unref, &ptr, sizeof(libdecor_unref_type));
-
-            ptr = dlsym(display->libdecor, "libdecor_decorate");
-            if (ptr != NULL) memcpy(&libdecor_decorate , &ptr, sizeof(libdecor_decorate_type));
-        }
+			WAYLIB_PROC_DEF(display->libdecor, libdecor_new);
+			WAYLIB_PROC_DEF(display->libdecor, libdecor_unref);
+			WAYLIB_PROC_DEF(display->libdecor, libdecor_new);
+            WAYLIB_PROC_DEF(display->libdecor, libdecor_decorate);
+			WAYLIB_PROC_DEF(display->libdecor, libdecor_frame_set_title);
+			WAYLIB_PROC_DEF(display->libdecor, libdecor_frame_set_app_id);
+			WAYLIB_PROC_DEF(display->libdecor, libdecor_dispatch);
+			WAYLIB_PROC_DEF(display->libdecor, libdecor_frame_map);
+			WAYLIB_PROC_DEF(display->libdecor, libdecor_frame_close);
+		}
 
         if (libdecor_new &&  libdecor_unref && libdecor_decorate) {
             static struct libdecor_interface interface = {
@@ -209,23 +197,47 @@ waylib_bool waylib_display_open(waylib_display* display) {
         }
     }
 
-	wl_display_roundtrip(display->dpy);
-    wl_registry_destroy(display->registry);
+	waylib_display_roundtrip(display, NULL);
+	waylib_display_dispatch(display, NULL);
 
-    if (display->decoration_manager != NULL)
-		zxdg_decoration_manager_v1_destroy(display->decoration_manager);
-
-    return WAYLIB_TRUE;
+	return WAYLIB_TRUE;
 }
 
-void wl_surface_frame_done(void* data, struct wl_callback *cb, uint32_t time) {
+waylib_bool waylib_display_roundtrip(waylib_display* display, int* event_count) {
+	int cnt = wl_display_roundtrip(display->dpy);
+	if (event_count) *event_count = cnt;
+	return (cnt >= 0);
+}
 
+waylib_bool waylib_display_dispatch(waylib_display* display, int* event_count) {
+	int cnt1 = 0;
+	if (libdecor_dispatch)
+		cnt1 = libdecor_dispatch(display->decor_ctx, 0);
+	int cnt2 = wl_display_dispatch(display->dpy);
+
+	if (event_count) {
+		if (cnt1 >= 0 && cnt2 >= 0)
+			*event_count = cnt1 + cnt2;
+		else
+			*event_count = -1;
+	}
+	return (cnt1 >= 0) && (cnt2 > 0);
+}
+
+waylib_bool waylib_display_flush(waylib_display* display, int* bytes) {
+	int cnt = wl_display_flush(display->dpy);
+	if (bytes) *bytes = cnt;
+	return (cnt >= 0);
 }
 
 waylib_bool waylib_display_close(waylib_display* display) {
     if (display->libdecor && display->decor_ctx && libdecor_unref) {
         libdecor_unref(display->decor_ctx);
     }
+
+	if (display->decoration_manager != NULL) {
+		zxdg_decoration_manager_v1_destroy(display->decoration_manager);
+	}
 
     if (display->cursor_theme) {
         wl_cursor_theme_destroy(display->cursor_theme);
@@ -239,28 +251,30 @@ waylib_bool waylib_display_close(waylib_display* display) {
 	return WAYLIB_TRUE;
 }
 
-waylib_bool waylib_window_init(waylib_display* display, int width, int height, waylib_window* window) {
-    waylib_surface_init(display, &window->surface);
-    wl_surface_set_user_data(window->surface.surface, window);
+void wl_surface_frame_done(void* data, struct wl_callback *cb, uint32_t time) {
 
-	static const struct xdg_surface_listener xdg_surface_listener = {
-		.configure = xdg_surface_configure_handler,
-	};
+}
 
-	static const struct wl_callback_listener wl_surface_frame_listener = {
-		.done = wl_surface_frame_done,
-	};
+const struct xdg_surface_listener xdg_surface_listener = {
+	.configure = xdg_surface_configure_handler,
+};
 
-	window->xdg_surface = xdg_wm_base_get_xdg_surface(display->xdg_wm_base, window->surface.surface);
-	xdg_surface_add_listener(window->xdg_surface, &xdg_surface_listener, NULL);
-	xdg_surface_set_user_data(window->xdg_surface, window);
+const struct wl_callback_listener wl_surface_frame_listener = {
+	.done = wl_surface_frame_done,
+};
 
-	window->xdg_toplevel = xdg_surface_get_toplevel(window->xdg_surface);
-	xdg_toplevel_set_user_data(window->xdg_toplevel, window);
+const struct xdg_toplevel_listener xdg_toplevel_listener = {
+	.configure = xdg_toplevel_configure_handler,
+	.close = xdg_toplevel_close_handler,
+};
 
-	xdg_surface_set_window_geometry(window->xdg_surface, 0, 0, width, height);
+waylib_bool waylib_window_init(waylib_display* display, waylib_surface* surface, int width, int height, waylib_window* window) {
+	window->surface = surface;
+	window->display = display;
 
-    if (libdecor_new &&  libdecor_unref) {
+	window->decoration = NULL;
+	window->decor_frame = NULL;
+	if (libdecor_new &&  libdecor_unref) {
         static struct libdecor_frame_interface frameInterface = {0}; /*= {
             wl_handle_configure,
             wl_handle_close,
@@ -268,29 +282,68 @@ waylib_bool waylib_window_init(waylib_display* display, int width, int height, w
             wl_handle_dismiss_popup,
         };*/
 
-        struct libdecor_frame* frame = libdecor_decorate(display->decor_ctx, window->surface.surface, &frameInterface, window);
-  //      libdecor_frame_set_app_id(frame, "my-libdecor-app");
-//        libdecor_frame_set_title(frame, "My Libdecor Window");
-    }
+//	    window->decor_frame = libdecor_decorate(display->decor_ctx, window->surface.surface, &frameInterface, window);
+//		libdecor_frame_map(window->decor_frame);
+	}
 
-	wl_display_roundtrip(display->dpy);
-	wl_surface_commit(window->surface.surface);
+	if (window->decor_frame == NULL) {
+		window->xdg_surface = xdg_wm_base_get_xdg_surface(display->xdg_wm_base, window->surface->surface);
+		window->xdg_toplevel = xdg_surface_get_toplevel(window->xdg_surface);
+		xdg_surface_add_listener(window->xdg_surface, &xdg_surface_listener, window);
+		xdg_toplevel_add_listener(window->xdg_toplevel, &xdg_toplevel_listener, window);
 
-	/* wait for the surface to be configured */
-	while (wl_display_dispatch(display->dpy) != -1) { }
+		xdg_surface_set_window_geometry(window->xdg_surface, 0, 0, width, height);
 
-	struct wl_callback* callback = wl_surface_frame(window->surface.surface);
+		if (display->decoration_manager) {
+			window->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(display->decoration_manager, window->xdg_toplevel);
+
+			static const struct zxdg_toplevel_decoration_v1_listener xdg_decoration_listener = {
+					.configure = xdg_decoration_configure_handler
+			};
+
+			zxdg_toplevel_decoration_v1_add_listener(window->decoration, &xdg_decoration_listener, NULL);
+		}
+	}
+
+	struct wl_callback* callback = wl_surface_frame(window->surface->surface);
 	wl_callback_add_listener(callback, &wl_surface_frame_listener, window);
-	wl_surface_commit(window->surface.surface);
-    return WAYLIB_TRUE;
+
+	wl_surface_commit(window->surface->surface);
+	waylib_display_flush(display, NULL);
+	return WAYLIB_TRUE;
 }
 
+waylib_bool waylib_window_set_app_id(waylib_window* window, const char* name) {
+	if (window->decor_frame) {
+		libdecor_frame_set_app_id(window->decor_frame, name);
+	} else {
+		xdg_toplevel_set_app_id(window->xdg_toplevel, name);
+	}
+
+	return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_window_set_title(waylib_window* window, const char* name) {
+	if (window->decor_frame) {
+		libdecor_frame_set_title(window->decor_frame, name);
+	} else {
+		xdg_toplevel_set_title(window->xdg_toplevel, name);
+	}
+
+	return WAYLIB_TRUE;
+}
+
+
 waylib_bool waylib_window_free(waylib_window* window) {
-    return WAYLIB_TRUE;
+	if (window->decor_frame) {
+		libdecor_frame_close(window->decor_frame);
+	}
+
+	return WAYLIB_TRUE;
 }
 
 waylib_bool waylib_surface_init(waylib_display* display, waylib_surface* surface) {
-    surface->surface = wl_compositor_create_surface(display->compositor);
+	surface->surface = wl_compositor_create_surface(display->compositor);
     return (surface->surface == NULL);
 }
 
@@ -300,9 +353,6 @@ waylib_bool waylib_surface_free(waylib_surface* surface) {
 }
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
-
-void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabilities);
-struct wl_seat_listener seat_listener = {&seat_capabilities};
 
 void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y) {
 
@@ -375,22 +425,32 @@ void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabilities) 
     }
 }
 
+void shm_format_handler(void* data, struct wl_shm *shm, uint32_t format) {
+}
+
+void doNothing(void) { }
+
 void registry_add_object(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
-    waylib_display* display = (waylib_display*)data;
-    if (!strcmp(interface, wl_compositor_interface.name)) {
-        display->compositor = (struct wl_compositor*)(wl_registry_bind (registry, name, &wl_compositor_interface, 1));
+    static struct wl_seat_listener seat_listener = {&seat_capabilities, (void (*)(void *, struct wl_seat *, const char *))&doNothing};
+    static const struct wl_shm_listener shm_listener = { .format = shm_format_handler };
+
+	waylib_display* display = (waylib_display*)data;
+	if (!strcmp(interface, wl_compositor_interface.name)) {
+        display->compositor = wl_registry_bind (registry, name, &wl_compositor_interface, 1);
     } else if (strcmp(interface, wl_subcompositor_interface.name) == 0) {
-        display->subcompositor = (struct wl_subcompositor*)(wl_registry_bind(registry, name, &wl_subcompositor_interface, 1));
+		display->subcompositor = wl_registry_bind(registry, name, &wl_subcompositor_interface, 1);
     } else if (!strcmp(interface, wl_seat_interface.name)) {
-        display->seat = (struct wl_seat*)(wl_registry_bind (registry, name, &wl_seat_interface, 0));
-        wl_seat_add_listener (display->seat, &seat_listener, data);
+		display->seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
+		wl_seat_add_listener (display->seat, &seat_listener, data);
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
-        display->shm = (struct wl_shm*)(wl_registry_bind(registry, name, &wl_shm_interface, 1));
-        display->cursor_theme = wl_cursor_theme_load(NULL, 32, display->shm);
+		display->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+		wl_shm_add_listener(display->shm, &shm_listener, NULL)	;
+		display->cursor_theme = wl_cursor_theme_load(NULL, 32, display->shm);
     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
-        display->xdg_wm_base = (struct xdg_wm_base*)wl_registry_bind(registry, name, &xdg_wm_base_interface, MIN(version, 1));
+		display->xdg_wm_base = (struct xdg_wm_base*)wl_registry_bind(registry, name, &xdg_wm_base_interface, MIN(version, 1));
+		xdg_wm_base_add_listener(display->xdg_wm_base, &xdg_wm_base_listener, display);
     } else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0) {
-        display->decoration_manager = wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, 1);
+		display->decoration_manager = wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, 1);
     }
 }
 
