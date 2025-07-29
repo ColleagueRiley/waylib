@@ -6,7 +6,7 @@
 
 int main(void) {
 	waylib_display display;
-	if (waylib_display_open(&display) == WAYLIB_FALSE) {
+	if (waylib_display_init(&display) == WAYLIB_FALSE) {
 		printf("failed to create a wayland display\n");
 		return 0;
 	}
@@ -22,6 +22,8 @@ int main(void) {
 
 	while (1) {
 		waylib_display_dispatch(&display, NULL);
+
+		waylib_surface_commit(&surface);
 	}
 
 	waylib_surface_free(&surface);

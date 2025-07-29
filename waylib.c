@@ -13,15 +13,22 @@
 
 #include "xdg-shell-client-protocol.h"
 #include "xdg-decoration-unstable-v1.h"
+#include "viewporter-client-protocol.h"
 
 #include "xdg-shell-client-protocol.c"
 #include "xdg-decoration-unstable-v1.c"
+#include "viewporter-client-protocol.c"
 
 #include <stdint.h>
 #include <string.h>
 
 #include <dlfcn.h>
 #include <assert.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <time.h>
 
 struct libdecor;
 enum libdecor_error {
@@ -158,7 +165,82 @@ const struct xdg_wm_base_listener xdg_wm_base_listener = {
 	if (ptr != NULL) memcpy(&name, &ptr, sizeof(name##_type)); \
 }
 
-waylib_bool waylib_display_open(waylib_display* display) {
+void randname(char *buf) {
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	long r = ts.tv_nsec;
+
+    int i;
+    for (i = 0; i < 6; ++i) {
+		buf[i] = (char)('A'+(r&15)+(r&16)*2);
+		r >>= 5;
+	}
+}
+
+int anonymous_shm_open(void) {
+	char name[] = "/wayland-XXXXXX";
+	int retries = 100;
+
+	do {
+		randname(name + strlen(name) - 6);
+
+		--retries;
+		/* shm_open guarantees that O_CLOEXEC is set */
+		int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+		if (fd >= 0) {
+			shm_unlink(name);
+			return fd;
+		}
+	} while (retries > 0 && errno == EEXIST);
+
+	return -1;
+}
+
+waylib_bool waylib_shm_init(waylib_display* display, unsigned long size, waylib_shm* mem) {
+	mem->display = display;
+	mem->size = size;
+	mem->fd = anonymous_shm_open();
+	if (mem->fd < 0) {
+		return WAYLIB_FALSE;
+	}
+
+	if (ftruncate(mem->fd, size) < 0) {
+		close(mem->fd);
+		return -1;
+	}
+
+	if (mem->fd < 0) {
+		return WAYLIB_FALSE;
+	}
+
+	mem->data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, mem->fd, 0);
+	if (mem->data == MAP_FAILED) {
+		return WAYLIB_FALSE;
+	}
+	return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_shm_free(waylib_shm* mem) {
+	munmap(mem->data, mem->size);
+	close(mem->fd);
+	return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_buffer_init_with_shm(waylib_shm* mem, int width, int height, int stride, unsigned int format, waylib_buffer* buffer) {
+	struct wl_shm_pool* pool = wl_shm_create_pool(mem->display->shm, mem->fd, mem->size);
+	buffer->buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride, format);
+	wl_shm_pool_destroy(pool);
+	return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_buffer_free(waylib_buffer* buffer) {
+	wl_buffer_destroy(buffer->buffer);
+	return WAYLIB_TRUE;
+}
+
+
+
+waylib_bool waylib_display_init(waylib_display* display) {
     memset(display, 0, sizeof(waylib_display));
     display->dpy = wl_display_connect(NULL);
 	if (display->dpy == NULL) {
@@ -268,7 +350,105 @@ const struct xdg_toplevel_listener xdg_toplevel_listener = {
 	.close = xdg_toplevel_close_handler,
 };
 
+waylib_bool waylib_subsurface_init(waylib_display* display,  waylib_surface* surface, waylib_surface* parent, waylib_subsurface* subsurface) {
+	subsurface->subsurface = wl_subcompositor_get_subsurface(display->subcompositor, surface->surface, parent->surface);
+	return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_subsurface_set_position(waylib_subsurface* subsurface, int x, int y) {
+	wl_subsurface_set_position(subsurface->subsurface, x, y);
+	return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_subsurface_free(waylib_subsurface* subsurface) {
+	wl_subsurface_destroy(subsurface->subsurface);
+	return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_viewport_init(waylib_display* display, waylib_surface* surface, waylib_viewport* viewport) {
+	viewport->viewport = wp_viewporter_get_viewport(display->viewporter, surface->surface);
+	return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_viewport_set_destination(waylib_viewport* viewport, int width, int height) {
+	wp_viewport_set_destination(viewport->viewport, width, height);
+	return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_viewport_free(waylib_viewport* viewport) {
+	wp_viewport_destroy(viewport->viewport);
+	return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_region_init(waylib_display* display, waylib_region* region) {
+	region->region = wl_compositor_create_region(display->compositor);
+	return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_region_add(waylib_region* region, int x, int y, int width, int height) {
+	wl_region_add(region->region, x, y, width, height);
+	return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_region_free(waylib_region* region) {
+	wl_region_destroy(region->region);
+	return WAYLIB_TRUE;
+}
+
+
+void create_fallback_edge(waylib_window* window, waylib_fallbackEdge* edge, waylib_surface* parent, waylib_buffer* buffer, int x, int y, int width, int height) {
+	waylib_surface_init(window->display, &edge->surface);
+	waylib_subsurface_init(window->display, &edge->surface, parent, &edge->subsurface);
+	wl_surface_set_user_data(edge->surface.surface, window);
+//    wl_proxy_set_tag((struct wl_proxy*) edge->surface, &display->tag);
+	waylib_subsurface_set_position(&edge->subsurface, x, y);
+	waylib_viewport_init(window->display, &edge->surface, &edge->viewport);
+	waylib_viewport_set_destination(&edge->viewport, width, height);
+	waylib_surface_attach(&edge->surface, buffer, 0, 0);
+
+	waylib_region region;
+	waylib_region_init(window->display, &region);
+	waylib_region_add(&region, 0, 0, width, height);
+    waylib_surface_set_opaque_region(&edge->surface, &region);
+    waylib_surface_commit(&edge->surface);
+	waylib_region_free(&region);
+}
+
+#define WAYLIB_BORDER_SIZE    4
+#define WAYLIB_CAPTION_HEIGHT 24
+
+void create_fallback_decorations(waylib_window* window, int width, int height) {
+    unsigned char data[] = { 224, 224, 224, 255 };
+
+    if (!window->fallback.buffer.buffer) {
+		waylib_shm_init(window->display, 4, &window->fallback.shm);
+		waylib_buffer_init_with_shm(&window->fallback.shm, 1, 1, 1 * 4, WL_SHM_FORMAT_ARGB8888, &window->fallback.buffer);
+	}
+    if (!window->fallback.buffer.buffer)
+        return;
+
+    create_fallback_edge(window, &window->fallback.top, window->surface,
+                       &window->fallback.buffer,
+                       0, -WAYLIB_CAPTION_HEIGHT,
+                       width, WAYLIB_CAPTION_HEIGHT);
+    create_fallback_edge(window, &window->fallback.left, window->surface,
+                       &window->fallback.buffer,
+                       -WAYLIB_BORDER_SIZE, -WAYLIB_CAPTION_HEIGHT,
+                       WAYLIB_BORDER_SIZE, height + WAYLIB_CAPTION_HEIGHT);
+    create_fallback_edge(window, &window->fallback.right, window->surface,
+                       &window->fallback.buffer,
+                       width, -WAYLIB_CAPTION_HEIGHT,
+                       WAYLIB_BORDER_SIZE, height + WAYLIB_CAPTION_HEIGHT);
+    create_fallback_edge(window, &window->fallback.bottom, window->surface,
+                       &window->fallback.buffer,
+                       -WAYLIB_BORDER_SIZE, height,
+                       width + WAYLIB_BORDER_SIZE * 2, WAYLIB_BORDER_SIZE);
+
+//    window->fallback.decorations = WAYLIB_TRUE;
+}
+
 waylib_bool waylib_window_init(waylib_display* display, waylib_surface* surface, int width, int height, waylib_window* window) {
+	memset(window, 0, sizeof(waylib_window));
 	window->surface = surface;
 	window->display = display;
 
@@ -302,6 +482,8 @@ waylib_bool waylib_window_init(waylib_display* display, waylib_surface* surface,
 			};
 
 			zxdg_toplevel_decoration_v1_add_listener(window->decoration, &xdg_decoration_listener, NULL);
+		} else {
+			create_fallback_decorations(window, width, height);
 		}
 	}
 
@@ -345,6 +527,21 @@ waylib_bool waylib_window_free(waylib_window* window) {
 waylib_bool waylib_surface_init(waylib_display* display, waylib_surface* surface) {
 	surface->surface = wl_compositor_create_surface(display->compositor);
     return (surface->surface == NULL);
+}
+
+waylib_bool waylib_surface_attach(waylib_surface* surface, waylib_buffer* buffer, int x, int y) {
+	wl_surface_attach(surface->surface, buffer->buffer, x, y);
+    return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_surface_set_opaque_region(waylib_surface* surface, waylib_region* region) {
+	wl_surface_set_opaque_region(surface->surface, region->region);
+    return WAYLIB_TRUE;
+}
+
+waylib_bool waylib_surface_commit(waylib_surface* surface) {
+	wl_surface_commit(surface->surface);
+    return WAYLIB_TRUE;
 }
 
 waylib_bool waylib_surface_free(waylib_surface* surface) {
@@ -428,10 +625,10 @@ void seat_capabilities(void *data, struct wl_seat *seat, uint32_t capabilities) 
 void shm_format_handler(void* data, struct wl_shm *shm, uint32_t format) {
 }
 
-void doNothing(void) { }
+void do_nothing(void) { }
 
 void registry_add_object(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version) {
-    static struct wl_seat_listener seat_listener = {&seat_capabilities, (void (*)(void *, struct wl_seat *, const char *))&doNothing};
+    static struct wl_seat_listener seat_listener = {&seat_capabilities, (void (*)(void *, struct wl_seat *, const char *))&do_nothing};
     static const struct wl_shm_listener shm_listener = { .format = shm_format_handler };
 
 	waylib_display* display = (waylib_display*)data;
@@ -451,6 +648,8 @@ void registry_add_object(void *data, struct wl_registry *registry, uint32_t name
 		xdg_wm_base_add_listener(display->xdg_wm_base, &xdg_wm_base_listener, display);
     } else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0) {
 		display->decoration_manager = wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, 1);
+    } else if (strcmp(interface, "wp_viewporter") == 0) {
+        display->viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
     }
 }
 
