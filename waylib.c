@@ -447,6 +447,26 @@ void create_fallback_decorations(waylib_window* window, int width, int height) {
 //    window->fallback.decorations = WAYLIB_TRUE;
 }
 
+void destroy_fallback_edge(waylib_fallbackEdge* edge) {
+    if (edge->subsurface.subsurface)
+        waylib_subsurface_free(&edge->subsurface);
+    if (edge->surface.surface)
+        waylib_surface_free(&edge->surface);
+    if (edge->viewport.viewport)
+        waylib_viewport_free(&edge->viewport);
+
+    edge->surface.surface = NULL;
+    edge->subsurface.subsurface = NULL;
+    edge->viewport.viewport = NULL;
+}
+
+static void destroy_fallback_decorations(waylib_window* window) {
+    destroy_fallback_edge(&window->fallback.top);
+    destroy_fallback_edge(&window->fallback.left);
+    destroy_fallback_edge(&window->fallback.right);
+    destroy_fallback_edge(&window->fallback.bottom);
+}
+
 waylib_bool waylib_window_init(waylib_display* display, waylib_surface* surface, int width, int height, waylib_window* window) {
 	memset(window, 0, sizeof(waylib_window));
 	window->surface = surface;
@@ -519,6 +539,10 @@ waylib_bool waylib_window_set_title(waylib_window* window, const char* name) {
 waylib_bool waylib_window_free(waylib_window* window) {
 	if (window->decor_frame) {
 		libdecor_frame_close(window->decor_frame);
+	}
+
+	if (window->fallback.top.surface.surface) {
+		destroy_fallback_decorations(window);
 	}
 
 	return WAYLIB_TRUE;
